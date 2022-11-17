@@ -1,0 +1,222 @@
+---
+#https://docs.ansible.com/ansible/latest/collections/ansible/posix/synchronize_module.html#ansible-collections-ansible-posix-synchronize-module
+
+- name: Synchronize Puzzle Massive resources directory from old swap to local
+  hosts: legacy_puzzle_massive_old_swap
+  remote_user: dev
+  tasks:
+
+    - name: Synchronize resources directory to local
+      ansible.posix.synchronize:
+        mode: pull
+        src: /srv/puzzle-massive/resources/
+        dest: "{{ resources_directory }}/"
+
+    - name: Copy .htpasswd to dev home
+      become: true
+      ansible.builtin.copy:
+        remote_src: yes
+        src: "/srv/puzzle-massive/.htpasswd"
+        dest: "/home/dev/.htpasswd"
+    - name: Set permissions on .htpasswd
+      become: true
+      ansible.builtin.file:
+        path: "/home/dev/.htpasswd"
+        owner: dev
+        group: dev
+
+    - name: Synchronize .htpasswd file to local
+      ansible.posix.synchronize:
+        mode: pull
+        src: "/home/dev/.htpasswd"
+        dest: "{{ htpasswd_file }}"
+
+- name: Synchronize old swap to new swap
+  hosts: legacy_puzzle_massive_new_swap
+  remote_user: dev
+  become: true
+  tasks:
+
+    - name: Set initial permissions
+      ansible.builtin.file:
+        path: "/srv/puzzle-massive/resources"
+        owner: dev
+        group: dev
+        recurse: yes
+        state: directory
+    - name: Synchronize resources directory from local
+      become: false
+      ansible.posix.synchronize:
+        src: "{{ resources_directory }}/"
+        dest: /srv/puzzle-massive/resources/
+    - name: Update permissions
+      ansible.builtin.file:
+        path: "/srv/puzzle-massive/resources"
+        owner: dev
+        group: dev
+        recurse: yes
+        state: directory
+
+    - name: Synchronize .htpasswd file that is used for admin logins
+      become: false
+      ansible.posix.synchronize:
+        src: "{{ htpasswd_file }}"
+        dest:  "/home/dev/.htpasswd"
+    - name: Copy .htpasswd to srv directory
+      become: true
+      ansible.builtin.copy:
+        remote_src: true
+        src: "/home/dev/.htpasswd"
+        dest: "/srv/puzzle-massive/.htpasswd"
+        owner: nginx
+        group: nginx
+
+- name: Stop old swap and backup
+  hosts: legacy_puzzle_massive_old_swap
+  user: dev
+  tasks:
+
+    - name: Show the message
+      become: true
+      ansible.builtin.template:
+        owner: dev
+        group: dev
+        mode: "0644"
+        src: "{{ message_file }}"
+        dest: /srv/puzzle-massive/root/puzzle-massive-message.html
+
+    - name: Stop old swap
+      become: true
+      command: "/usr/local/src/puzzle-massive/bin/appctl.sh stop"
+      args:
+        chdir: /usr/local/src/puzzle-massive/
+
+    - name: Clear NGINX cache
+      become: true
+      command: "/usr/local/src/puzzle-massive/bin/clear_nginx_cache.sh -y"
+      args:
+        chdir: /usr/local/src/puzzle-massive/
+
+    - name: Start only api service
+      become: true
+      ansible.builtin.systemd:
+        name: puzzle-massive-api
+        state: started
+
+    - name: Create backup
+      command: "/usr/local/src/puzzle-massive/bin/backup.sh -c db-old_swap.dump.gz"
+      args:
+        chdir: /usr/local/src/puzzle-massive/
+
+    - name: Stop api service
+      become: true
+      ansible.builtin.systemd:
+        name: puzzle-massive-api
+        state: stopped
+
+    - name: Second synchronize of the puzzle massive resources directory from old_swap to local
+      ansible.posix.synchronize:
+        mode: pull
+        src: /srv/puzzle-massive/resources/
+        dest: "{{ resources_directory }}/"
+
+    - name: Copy sqlite database
+      ansible.posix.synchronize:
+        mode: pull
+        src: "/usr/local/src/puzzle-massive/db-old_swap.dump.gz"
+        dest: "{{ old_swap_db_backup }}"
+
+- name: Setup new swap with old swap data
+  hosts: legacy_puzzle_massive_new_swap
+  user: dev
+  tasks:
+
+    - name: Remove blank sqlite db from new swap
+      ansible.builtin.file:
+        state: absent
+        path: "/var/lib/puzzle-massive/sqlite3/db"
+    - name: Remove blank sqlite db-shm from new swap
+      ansible.builtin.file:
+        state: absent
+        path: "/var/lib/puzzle-massive/sqlite3/db-shm"
+    - name: Remove blank sqlite db-wal from new swap
+      ansible.builtin.file:
+        state: absent
+        path: "/var/lib/puzzle-massive/sqlite3/db-wal"
+
+    - name: Clear nginx cache
+      command: "./bin/clear_nginx_cache.sh -y"
+      args:
+        chdir: /usr/local/src/puzzle-massive/
+      become: true
+
+    - name: Get the redis database number
+      command: ./bin/puzzle-massive-site-cfg-echo site.cfg REDIS_DB
+      args:
+        chdir: /usr/local/src/puzzle-massive/
+      register: REDIS_DB
+
+    - name: Use `flushdb` on the new server to remove all keys on the redis database.
+      command: "redis-cli -n {{ REDIS_DB }} flushdb"
+
+    - name: Set initial permissions
+      become: true
+      ansible.builtin.file:
+        path: "/srv/puzzle-massive/resources"
+        owner: dev
+        group: dev
+        recurse: yes
+        state: directory
+    - name: Synchronize resources directory from local
+      become: false
+      ansible.posix.synchronize:
+        src: "{{ resources_directory }}/"
+        dest: /srv/puzzle-massive/resources/
+    - name: Update permissions
+      become: true
+      ansible.builtin.file:
+        path: "/srv/puzzle-massive/resources"
+        owner: dev
+        group: dev
+        recurse: yes
+        state: directory
+
+    - name: Copy sqlite database
+      ansible.posix.synchronize:
+        src: "{{ old_swap_db_backup }}"
+        dest: /usr/local/src/puzzle-massive/
+
+    - name: Touch sqlite3 database file db
+      ansible.builtin.file:
+        state: touch
+        owner: dev
+        group: dev
+        path: "/var/lib/puzzle-massive/sqlite3/db"
+    - name: Load up the sqlite db file with the db-old_swap.dump.gz
+      shell: zcat db-old_swap.dump.gz | sqlite3 /var/lib/puzzle-massive/sqlite3/db
+      args:
+        chdir: /usr/local/src/puzzle-massive/
+
+    - name: Update the sqlite db file with the db.dump.sql
+      shell: cat db.dump.sql | sqlite3 /var/lib/puzzle-massive/sqlite3/db
+      args:
+        chdir: /usr/local/src/puzzle-massive/
+
+    - name: Set the sqlite db to be in wal mode
+      shell: echo 'pragma journal_mode=wal' | sqlite3 /var/lib/puzzle-massive/sqlite3/db
+
+    - name: Migrate PuzzleMassive database_version if needed
+      command: /usr/local/src/puzzle-massive/bin/python api/api/jobs/migrate_puzzle_massive_database_version.py
+      args:
+        chdir: /usr/local/src/puzzle-massive/
+
+    - name: Update any bit icon authors and add new bit icons
+      command: /usr/local/src/puzzle-massive/bin/python api/api/jobs/insert-or-replace-bit-icons.py
+      args:
+        chdir: /usr/local/src/puzzle-massive/
+
+    - name: Update the enabled puzzle features
+      command: /usr/local/src/puzzle-massive/bin/python api/api/update_enabled_puzzle_features.py
+      args:
+        chdir: /usr/local/src/puzzle-massive/
+

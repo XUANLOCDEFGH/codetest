@@ -1,0 +1,9 @@
+{
+  "root": true,
+  "env": { "browser": true, "es2021": true },
+  "parserOptions": {
+    "sourceType": "module",
+    "ecmaFeatures": { "impliedStrict": true }
+  },
+  "extends": ["eslint:recommended", "prettier"]
+}
